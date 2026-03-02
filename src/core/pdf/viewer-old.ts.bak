@@ -1,19 +1,9 @@
 /**
- * PDF 渲染器 - 基于 PDF.js（懒加载优化）
+ * PDF 渲染器 - 基于 foliate-js
  */
-import type { PDFDocumentProxy } from 'pdfjs-dist'
 import type { PDFViewerOptions, PDFLocation } from './types'
 import { markRaw } from 'vue'
 import { PRESET_THEMES } from '@/composables/useSetting'
-
-// 动态加载思源内置的 PDF.js
-let pdfjsLib: any = null
-async function loadPDFJS() {
-  if (pdfjsLib) return pdfjsLib
-  pdfjsLib = await import('/stage/protyle/js/pdf/pdf.min.mjs')
-  pdfjsLib.GlobalWorkerOptions.workerSrc = '/stage/protyle/js/pdf/pdf.worker.min.mjs'
-  return pdfjsLib
-}
 
 // 解析 CSS 变量为实际颜色值
 const resolveColor = (c: string) => c.startsWith('var(') ? getComputedStyle(document.documentElement).getPropertyValue(c.slice(4, -1)).trim() : c
@@ -23,7 +13,7 @@ const invertColor = (hex: string) => '#' + hex.replace('#', '').match(/.{2}/g)!.
 const isDarkBg = (bg: string) => { const h = bg?.replace('#', '') || '0'; return parseInt(h.length === 3 ? h.split('').map(x => x + x).join('') : h, 16) < 0x808080 }
 
 export class PDFViewer {
-  private pdf: PDFDocumentProxy | null = null
+  private book: any = null
   private container: HTMLElement
   private scale: number
   private rotation = 0
@@ -59,27 +49,30 @@ export class PDFViewer {
     this.container.querySelectorAll('.pdf-page').forEach((p: Element) => {
       const el = p as HTMLElement
       el.style.background = th.bg
-      const canvas = el.querySelector('canvas')
-      if (canvas) canvas.style.filter = filters || 'none'
+      const iframe = el.querySelector('iframe')
+      if (iframe) iframe.style.filter = filters || 'none'
     })
     if (settings.viewMode) this.viewMode = settings.viewMode
     settings.theme === 'auto' && !this.themeObserver && (this.themeObserver = watchTheme(() => this.updateTheme(settings)) as any)
   }
 
   async open(src: string | ArrayBuffer) {
-    const pdfjs = await loadPDFJS()
-    this.pdf = markRaw(await pdfjs.getDocument({
-      data: src,
-      cMapUrl: '/stage/protyle/js/pdf/cmaps/',
-      cMapPacked: true,
-      standardFontDataUrl: '/stage/protyle/js/pdf/standard_fonts/',
-      useSystemFonts: false,
-      disableFontFace: false,
-      useWorkerFetch: true,
-      isEvalSupported: false,
-      maxImageSize: 16777216
-    }).promise) as any
-    this.pages.set(1, markRaw(await this.pdf.getPage(1)))
+    const { makePDF } = await import('foliate-js/pdf.js')
+    
+    // 将 ArrayBuffer 转换为 File 对象
+    const file = src instanceof ArrayBuffer 
+      ? new File([src], 'document.pdf', { type: 'application/pdf' })
+      : await (await fetch(src)).blob()
+    
+    this.book = markRaw(await makePDF(file))
+    
+    // 获取第一页用于初始化
+    const firstSection = this.book.sections[0]
+    if (firstSection) {
+      const pageData = await firstSection.load()
+      this.pages.set(1, pageData)
+    }
+    
     await this.fitWidth()
     this.setupScroll()
   }
@@ -128,7 +121,6 @@ export class PDFViewer {
     let p = this.pages.get(n)
     if (!p && this.pdf) { p = markRaw(await this.pdf.getPage(n)); this.pages.set(n, p) }
     if (!p) return
-    const pdfjs = await loadPDFJS()
     const bg = this.container.style.getPropertyValue('--pdf-page-bg') || '#fff'
     w.style.background = bg
     const vp = p.getViewport({ scale: this.scale, rotation: this.rotation })
@@ -142,7 +134,11 @@ export class PDFViewer {
       c.width = Math.floor(vp.width * dpr)
       c.height = Math.floor(vp.height * dpr)
       c.style.cssText = `width:${vp.width}px;height:${vp.height}px${filters ? `;filter:${filters}` : ''}`
-      await p.render({ canvasContext: ctx, viewport: vp, transform: [dpr, 0, 0, dpr, 0, 0], background: canvasBg, enableWebGL: true }).promise
+      await p.render({ 
+        canvasContext: ctx, 
+        viewport: vp, 
+        transform: [dpr, 0, 0, dpr, 0, 0]
+      }).promise
       w.appendChild(c)
     } catch (e: any) { console.error(`[PDF] 渲染失败 ${n}:`, e); w.style.background = '#fee'; w.innerHTML = `<div style="padding:20px;color:#c00">渲染失败</div>`; return }
     // 文本层（智能合并）
@@ -156,17 +152,19 @@ export class PDFViewer {
         for (let i = 0, its = tc.items; i < its.length;) {
           const it = its[i]
           if (!it.str) { i++; continue }
-          const t = pdfjs.Util.transform(vp.transform, it.transform), h = Math.hypot(t[2], t[3]), a = Math.atan2(t[1], t[0])
+          const t = [vp.transform[0] * it.transform[0] + vp.transform[2] * it.transform[1], vp.transform[1] * it.transform[0] + vp.transform[3] * it.transform[1], vp.transform[0] * it.transform[2] + vp.transform[2] * it.transform[3], vp.transform[1] * it.transform[2] + vp.transform[3] * it.transform[3], vp.transform[0] * it.transform[4] + vp.transform[2] * it.transform[5] + vp.transform[4], vp.transform[1] * it.transform[4] + vp.transform[3] * it.transform[5] + vp.transform[5]]
+          const h = Math.hypot(t[2], t[3]), a = Math.atan2(t[1], t[0])
           let txt = it.str, x = t[4] + it.width * h, j = i + 1
           for (; j < its.length; j++) {
             const n = its[j]
             if (!n.str) continue
-            const nt = pdfjs.Util.transform(vp.transform, n.transform), nh = Math.hypot(nt[2], nt[3])
+            const nt = [vp.transform[0] * n.transform[0] + vp.transform[2] * n.transform[1], vp.transform[1] * n.transform[0] + vp.transform[3] * n.transform[1], vp.transform[0] * n.transform[2] + vp.transform[2] * n.transform[3], vp.transform[1] * n.transform[2] + vp.transform[3] * n.transform[3], vp.transform[0] * n.transform[4] + vp.transform[2] * n.transform[5] + vp.transform[4], vp.transform[1] * n.transform[4] + vp.transform[3] * n.transform[5] + vp.transform[5]]
+            const nh = Math.hypot(nt[2], nt[3])
             if (Math.abs(nt[5] - t[5]) > h * .3 || Math.abs(Math.atan2(nt[1], nt[0]) - a) > .01 || Math.abs(nh - h) > h * .1 || nt[4] - x > h * 2) break
             txt += n.str
             x = nt[4] + n.width * nh
           }
-          d.innerHTML += `<span style="position:absolute;left:${t[4]}px;top:${t[5]}px;font-size:${h}px;transform:rotate(${a}rad)translateY(-.8em);transform-origin:0 0;white-space:pre;color:transparent;cursor:text">${txt}</span>`
+          d.innerHTML += `<span role="presentation" style="position:absolute;left:${t[4]}px;top:${t[5]}px;font-size:${h}px;transform:rotate(${a}rad)translateY(-.8em);transform-origin:0 0;white-space:pre;color:transparent;cursor:text">${txt}</span>`
           i = j
         }
       })
@@ -206,7 +204,6 @@ export class PDFViewer {
 
   private async renderLinks(_n: number, w: HTMLElement, p: any, vp: any) {
     try {
-      const pdfjs = await loadPDFJS()
       const anns = await p.getAnnotations()
       const layer = document.createElement('div')
       layer.className = 'annotationLayer'
@@ -215,8 +212,10 @@ export class PDFViewer {
       for (const a of anns) {
         if (a.subtype !== 'Link') continue
         const link = document.createElement('a')
-        const [x1, y1, x2, y2] = pdfjs.Util.normalizeRect(a.rect)
-        const [p1, p2] = [vp.convertToViewportPoint(x1, y1), vp.convertToViewportPoint(x2, y2)]
+        // 手动normalize rect
+        const [x1, y1, x2, y2] = a.rect
+        const normalizedRect = [Math.min(x1, x2), Math.min(y1, y2), Math.max(x1, x2), Math.max(y1, y2)]
+        const [p1, p2] = [vp.convertToViewportPoint(normalizedRect[0], normalizedRect[1]), vp.convertToViewportPoint(normalizedRect[2], normalizedRect[3])]
         link.style.cssText = `position:absolute;left:${Math.min(p1[0], p2[0])}px;top:${Math.min(p1[1], p2[1])}px;width:${Math.abs(p2[0] - p1[0])}px;height:${Math.abs(p2[1] - p1[1])}px;cursor:pointer;pointer-events:auto`
         if (a.url) { link.href = a.url; link.target = '_blank' }
         else if (a.dest) {
